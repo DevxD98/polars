@@ -1030,6 +1030,31 @@ def test_max_statistic_parquet_writer() -> None:
     assert_frame_equal(result, expected)
 
 
+@pytest.mark.parametrize("dtype", [pl.Float16, pl.Float32, pl.Float64])
+@pytest.mark.parametrize(
+    ("nan_idx", "target"),
+    [
+        (1, 1999.0),  # NaN in the page holding the maximum
+        (1998, 0.0),  # NaN in the page holding the minimum
+    ],
+)
+@pytest.mark.parametrize("engine", ["streaming", "in-memory"])
+def test_parquet_nan_page_statistics_29640(
+    dtype: pl.DataType, nan_idx: int, target: float, engine: EngineType
+) -> None:
+    values = [float(i) for i in reversed(range(2000))]
+    values[nan_idx] = float("nan")
+    df = pl.DataFrame({"a": values}, schema={"a": dtype})
+
+    f = io.BytesIO()
+    df.write_parquet(f, row_group_size=2000, data_page_size=512)
+
+    f.seek(0)
+    result = pl.scan_parquet(f).filter(pl.col("a") == target).collect(engine=engine)
+    assert_frame_equal(result, df.filter(pl.col("a") == target))
+    assert result.height == 1
+
+
 @pytest.mark.slow
 def test_hybrid_rle() -> None:
     # 10_007 elements to test if not a nice multiple of 8

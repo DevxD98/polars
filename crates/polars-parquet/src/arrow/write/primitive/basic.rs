@@ -2,6 +2,7 @@ use polars_arrow::array::{Array, PrimitiveArray};
 use polars_arrow::scalar::PrimitiveScalar;
 use polars_arrow::types::NativeType;
 use polars_error::{PolarsResult, polars_bail};
+use polars_utils::float::IsFloat;
 
 use super::super::{WriteOptions, utils};
 use crate::arrow::read::schema::is_nullable;
@@ -114,7 +115,7 @@ pub fn array_to_page_plain<T, P>(
 where
     T: NativeType,
     P: ParquetNativeType,
-    T: num_traits::AsPrimitive<P>,
+    T: num_traits::AsPrimitive<P> + IsFloat,
 {
     array_to_page(array, options, type_, Encoding::Plain, encode_plain)
 }
@@ -128,7 +129,7 @@ pub fn array_to_page_integer<T, P>(
 where
     T: NativeType,
     P: ParquetNativeType,
-    T: num_traits::AsPrimitive<P>,
+    T: num_traits::AsPrimitive<P> + IsFloat,
     P: num_traits::AsPrimitive<i64>,
 {
     match encoding {
@@ -150,7 +151,7 @@ where
     T: NativeType,
     P: ParquetNativeType,
     // constraint required to build statistics
-    T: num_traits::AsPrimitive<P>,
+    T: num_traits::AsPrimitive<P> + IsFloat,
 {
     let is_optional = is_nullable(&type_.field_info);
     let encode_options = EncodeNullability::new(is_optional);
@@ -198,22 +199,24 @@ pub fn build_statistics<T, P>(
 where
     T: NativeType,
     P: ParquetNativeType,
-    T: num_traits::AsPrimitive<P>,
+    T: num_traits::AsPrimitive<P> + IsFloat,
 {
+    // Float bounds leave out NaN, as Parquet requires. The NaN-ignoring kernels only give NaN
+    // if all non-null values are NaN, and then the bound is left out.
     let (min_value, max_value) = match (options.min_value, options.max_value) {
         (true, true) => {
-            match polars_compute::min_max::dyn_array_min_max_propagate_nan(array as &dyn Array) {
+            match polars_compute::min_max::dyn_array_min_max_ignore_nan(array as &dyn Array) {
                 None => (None, None),
                 Some((l, r)) => (Some(l), Some(r)),
             }
         },
         (true, false) => (
-            polars_compute::min_max::dyn_array_min_propagate_nan(array as &dyn Array),
+            polars_compute::min_max::dyn_array_min_ignore_nan(array as &dyn Array),
             None,
         ),
         (false, true) => (
             None,
-            polars_compute::min_max::dyn_array_max_propagate_nan(array as &dyn Array),
+            polars_compute::min_max::dyn_array_max_ignore_nan(array as &dyn Array),
         ),
         (false, false) => (None, None),
     };
@@ -223,6 +226,7 @@ where
             .downcast_ref::<PrimitiveScalar<T>>()
             .unwrap()
             .value()
+            .filter(|x| !x.is_nan())
             .map(|x| x.as_().norm_min())
     });
     let max_value = max_value.and_then(|s| {
@@ -230,6 +234,7 @@ where
             .downcast_ref::<PrimitiveScalar<T>>()
             .unwrap()
             .value()
+            .filter(|x| !x.is_nan())
             .map(|x| x.as_().norm_max())
     });
 
@@ -239,5 +244,43 @@ where
         distinct_count: None,
         max_value,
         min_value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parquet::schema::types::PhysicalType;
+
+    fn bounds<T>(values: &[Option<T>], physical_type: PhysicalType) -> (Option<T>, Option<T>)
+    where
+        T: NativeType + num_traits::AsPrimitive<T> + IsFloat + ParquetNativeType,
+    {
+        let array = PrimitiveArray::from(values.to_vec());
+        let type_ = PrimitiveType::from_physical("a".into(), physical_type);
+        let stats = build_statistics::<T, T>(&array, type_, &StatisticsOptions::full());
+        (stats.min_value, stats.max_value)
+    }
+
+    fn check(values: &[Option<f64>], expected: Option<(f64, f64)>) {
+        let (min, max) = bounds(values, PhysicalType::Double);
+        assert_eq!(min.zip(max), expected, "{values:?}");
+
+        let values: Vec<_> = values.iter().map(|v| v.map(|x| x as f32)).collect();
+        let expected = expected.map(|(l, r)| (l as f32, r as f32));
+        let (min, max) = bounds(&values, PhysicalType::Float);
+        assert_eq!(min.zip(max), expected, "{values:?}");
+    }
+
+    #[test]
+    fn float_statistics_ignore_nan() {
+        let nan = f64::NAN;
+        check(&[Some(1.0), Some(nan), Some(3.0)], Some((1.0, 3.0)));
+        check(&[Some(nan), Some(1.0), Some(3.0)], Some((1.0, 3.0)));
+        check(&[Some(1.0), Some(3.0), Some(nan)], Some((1.0, 3.0)));
+        check(&[Some(nan)], None);
+        check(&[None, Some(nan), None], None);
+        check(&[None, Some(nan), Some(2.0), None], Some((2.0, 2.0)));
+        check(&[None, None], None);
     }
 }

@@ -1,6 +1,7 @@
 use polars_arrow::array::{Array, PrimitiveArray};
 use polars_arrow::types::NativeType as ArrowNativeType;
 use polars_error::PolarsResult;
+use polars_utils::float::IsFloat;
 
 use super::super::{WriteOptions, nested, utils};
 use super::basic::{build_statistics, encode_plain};
@@ -21,7 +22,7 @@ pub fn array_to_page<T, R>(
 where
     T: ArrowNativeType,
     R: NativeType,
-    T: num_traits::AsPrimitive<R>,
+    T: num_traits::AsPrimitive<R> + IsFloat,
 {
     let is_optional = is_nullable(&type_.field_info);
     let encode_options = EncodeNullability::new(is_optional);
